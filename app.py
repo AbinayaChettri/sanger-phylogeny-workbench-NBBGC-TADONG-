@@ -297,11 +297,11 @@ with st.expander("📖 Quick-Start Rules & Outgroup Guide (Read First Before Run
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    primary_up = st.file_uploader("1. Upload Query (.ab1 or .fasta) *", type=["ab1", "abi", "fasta", "fa", "fna"])
+    primary_up = st.file_uploader("1. Upload Query (.ab1 or .fasta) *")
 with col2:
-    reverse_up = st.file_uploader("2. Optional Reverse Read (.ab1 for F+R consensus)", type=["ab1", "abi"])
+    reverse_up = st.file_uploader("2. Optional Reverse Read (.ab1 for F+R consensus)")
 with col3:
-    custom_refs_up = st.file_uploader("3. Optional Custom References (.fasta — skips BLAST)", type=["fasta", "fa", "fna"])
+    custom_refs_up = st.file_uploader("3. Optional Custom References (.fasta — skips BLAST)")
 
 c1, c2 = st.columns(2)
 with c1:
