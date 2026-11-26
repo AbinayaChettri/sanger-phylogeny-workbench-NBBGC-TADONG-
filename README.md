@@ -1,6 +1,7 @@
 # Universal Sanger-to-Phylogeny Workbench (v2.0)
 
 **Developed by Abinaya Chettri (M.Sc. Zoology)**
+🚀 **Live Web App (Free, Zero Install):** https://nbbgc-tadong-phylogeny.streamlit.app
 
 An automated, zero-code browser workbench that turns raw Sanger `.ab1` chromatograms (Forward + Reverse) or `.fasta` sequences into publication-ready Maximum Likelihood phylogenies, colored SNP maps, genetic distance matrices, and population genetics summaries.
 
