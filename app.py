@@ -1,6 +1,7 @@
 import datetime
 import math
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -8,6 +9,7 @@ import tempfile
 import zipfile
 from collections import Counter, defaultdict
 
+import Bio
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -20,10 +22,19 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 
 st.set_page_config(
-    page_title="Sanger-to-Phylogeny Workbench (v2.0)",
+    page_title="Sanger-to-Phylogeny Workbench (v2.1)",
     page_icon="🧬",
     layout="wide",
 )
+
+
+def get_tool_version(cmd_list, fallback="installed"):
+    try:
+        res = subprocess.run(cmd_list, capture_output=True, text=True, timeout=5)
+        txt = (res.stdout + "\n" + res.stderr).strip().splitlines()
+        return txt[0].strip()[:80] if txt else fallback
+    except Exception:
+        return fallback
 
 
 def mott_trim(quals, q_cutoff=20):
@@ -76,6 +87,7 @@ def plot_qc(rec, s, e, out_png):
 
 
 def merge_fr(seq_f, q_f, seq_r, q_r):
+    """Aligns Forward and Reverse-Complement reads and returns consensus + overlap QC stats."""
     seq_r_rc = str(Seq(seq_r).reverse_complement())
     q_r_rc = list(reversed(q_r)) if q_r else []
     aligner = Align.PairwiseAligner()
@@ -84,7 +96,7 @@ def merge_fr(seq_f, q_f, seq_r, q_r):
     aligner.open_gap_score, aligner.extend_gap_score = -4.0, -0.5
     aln = aligner.align(seq_f, seq_r_rc)[0]
     a_str, b_str = str(aln[0]), str(aln[1])
-    cons, i_f, i_r, mm = [], 0, 0, 0
+    cons, i_f, i_r, mm, ov_bp, ov_match = [], 0, 0, 0, 0, 0
     for ca, cb in zip(a_str, b_str):
         qf = q_f[i_f] if (ca != "-" and i_f < len(q_f)) else -1
         qr = q_r_rc[i_r] if (cb != "-" and i_r < len(q_r_rc)) else -1
@@ -96,28 +108,34 @@ def merge_fr(seq_f, q_f, seq_r, q_r):
             cons.append(cb)
         elif cb == "-":
             cons.append(ca)
-        elif ca == cb:
-            cons.append(ca)
         else:
-            mm += 1
-            cons.append(ca if qf >= qr else cb)
-    return "".join(cons), mm
+            ov_bp += 1
+            if ca == cb:
+                ov_match += 1
+                cons.append(ca)
+            else:
+                mm += 1
+                cons.append(ca if qf >= qr else cb)
+    ov_id = round(100.0 * ov_match / max(ov_bp, 1), 2) if ov_bp > 0 else 0.0
+    return "".join(cons), mm, ov_bp, ov_id
 
 
 def fetch_genbank_with_metadata(acc_list, outgroup_acc=None):
+    """Fetches authoritative GenBank records (Organism, Marker, Country, Host) via Entrez."""
     refs, meta_rows = [], []
     outgroup_label = None
     with Entrez.efetch(db="nucleotide", id=",".join(acc_list), rettype="gb", retmode="text") as h:
         for gb in SeqIO.parse(h, "genbank"):
             acc = gb.id.split(".")[0]
             org = gb.annotations.get("organism", "Unknown")
-            country, host = "", ""
+            country, host, marker = "", "", ""
             for feat in gb.features:
                 if feat.type == "source":
                     c_raw = feat.qualifiers.get("geo_loc_name", feat.qualifiers.get("country", [""]))[0]
                     country = c_raw.split(":")[0].strip()
                     host = feat.qualifiers.get("host", [""])[0].strip()
-                    break
+                elif not marker and feat.type in ("gene", "CDS", "rRNA", "misc_RNA"):
+                    marker = feat.qualifiers.get("gene", feat.qualifiers.get("product", [""]))[0].strip()
             org_short = "_".join(org.split()[:2])
             parts = [acc, org_short]
             if country:
@@ -128,12 +146,19 @@ def fetch_genbank_with_metadata(acc_list, outgroup_acc=None):
             if outgroup_acc and acc.startswith(outgroup_acc.split(".")[0]):
                 outgroup_label = clean_lbl
             refs.append(SeqRecord(gb.seq, id=clean_lbl, description=""))
-            meta_rows.append({"Accession": acc, "Organism": org, "Country": country or "N/A", "Host": host or "N/A", "Length_bp": len(gb.seq)})
+            meta_rows.append({
+                "Accession": acc,
+                "Organism": org,
+                "Marker": marker or "N/A",
+                "Country": country or "N/A",
+                "Host": host or "N/A",
+                "Length_bp": len(gb.seq),
+            })
     return refs, pd.DataFrame(meta_rows), outgroup_label
 
 
-def smart_blast_v2(query_seq, max_refs, extra_accs_str, outgroup_acc, email, work_dir):
-    Entrez.email = email.strip() or "user@example.com"
+def smart_blast_v2(query_seq, max_refs, extra_accs_str, outgroup_acc, email, work_dir, warnings_list):
+    Entrez.email = email.strip()
     handle = NCBIWWW.qblast("blastn", "nt", query_seq, hitlist_size=100)
     blast_rec = NCBIXML.read(handle)
     handle.close()
@@ -153,6 +178,13 @@ def smart_blast_v2(query_seq, max_refs, extra_accs_str, outgroup_acc, email, wor
 
     blast_df = pd.DataFrame(all_hits)
     blast_df.to_csv(f"{work_dir}/02_blast_top_hits.csv", index=False)
+
+    # Flag potential multi-species BLAST ties (>=99% ID, >=80% cov)
+    top_sp = {r["Species"] for r in all_hits if r["Pct_ID"] >= 99.0 and r["Cov_Pct"] >= 80.0}
+    if len(top_sp) > 1:
+        warnings_list.append(f"BLAST multi-species tie: multiple taxa matched >=99% ID ({', '.join(sorted(top_sp)[:4])}). Inspect tree & metadata carefully.")
+    if all_hits and all_hits[0]["Pct_ID"] < 97.0:
+        warnings_list.append(f"Low top BLAST identity ({all_hits[0]['Pct_ID']}%). Species-level ID is uncertain; verify marker and chromatogram.")
 
     by_sp = defaultdict(list)
     for row in all_hits:
@@ -183,24 +215,37 @@ def smart_blast_v2(query_seq, max_refs, extra_accs_str, outgroup_acc, email, wor
             if a and a not in acc_list:
                 acc_list.append(a)
 
+    # v2.1: Never auto-guess an outgroup from BLAST hits; only root on user-verified Outgroup
     og_target = outgroup_acc.strip() if outgroup_acc and outgroup_acc.strip() else None
     if og_target and og_target not in acc_list:
         acc_list.append(og_target)
-    elif not og_target and len(sp_order) > 1:
-        og_target = picked[-1]["Accession"]
 
     refs, meta_df, outgroup_label = fetch_genbank_with_metadata(acc_list, og_target)
+    if og_target and not outgroup_label:
+        warnings_list.append(f"Requested outgroup '{og_target}' could not be retrieved from GenBank; falling back to midpoint rooting.")
+
+    # Warn if any fetched reference/outgroup is much shorter than query (<60%)
+    for _, row in meta_df.iterrows():
+        if row["Length_bp"] < 0.60 * len(query_seq):
+            warnings_list.append(f"Short reference/outgroup detected: {row['Accession']} ({row['Organism']}, {row['Length_bp']} bp vs. query {len(query_seq)} bp) — short sequences can distort branch lengths.")
+
     meta_df.to_csv(f"{work_dir}/02_reference_metadata_country_host.csv", index=False)
     return refs, blast_df.head(20), meta_df, outgroup_label
 
 
-def compute_popgen_stats(trimmed_recs, work_dir):
-    seqs = [str(r.seq).upper() for r in trimmed_recs]
+def compute_popgen_stats(trimmed_recs, work_dir, outgroup_label=None):
+    """Computes PopGen stats on INGROUP sequences only (excluding biological outgroup) and reports excluded gapped sites."""
+    ingroup = [r for r in trimmed_recs if not (outgroup_label and r.id == outgroup_label)]
+    if len(ingroup) < 2:
+        ingroup = trimmed_recs
+
+    seqs = [str(r.seq).upper() for r in ingroup]
     n = len(seqs)
     L = len(seqs[0])
     arr = np.array([list(s) for s in seqs])
 
     clean_cols = [c for c in range(L) if all(b in "ACGT" for b in arr[:, c])]
+    excluded_cols = L - len(clean_cols)
     sub = arr[:, clean_cols] if clean_cols else arr
     L_clean = sub.shape[1]
 
@@ -230,8 +275,9 @@ def compute_popgen_stats(trimmed_recs, work_dir):
             tajima_d = (k - S / a1) / math.sqrt(var_d)
 
     pop_df = pd.DataFrame([{
-        "Taxa_n": int(n),
-        "Ungapped_Sites_bp": int(L_clean),
+        "Ingroup_Taxa_n": int(n),
+        "Ungapped_ACGT_Sites_bp": int(L_clean),
+        "Excluded_Gapped_or_Ambig_bp": int(excluded_cols),
         "Haplotypes_h": int(h),
         "Haplotype_Diversity_Hd": round(hd, 4),
         "Nucleotide_Diversity_pi": round(pi_val, 5),
@@ -264,21 +310,22 @@ def plot_snp_map(trimmed_recs, out_png):
         ax.set_yticklabels([r.id[:32] for r in reversed(trimmed_recs)], fontsize=7.5)
         ax.set_xticks([i + 0.5 for i in range(len(show_cols))])
         ax.set_xticklabels([str(c + 1) for c in show_cols], rotation=90, fontsize=6.5)
-        ax.set_xlabel("Alignment Position (bp) — Variable SNP Sites Only")
+        ax.set_xlabel("Alignment Position (bp) — All Variable Sites (including gapped/outgroup columns)")
         ax.set_title(f"Alignment SNP & Mismatch Map ({len(var_cols)} variable sites; showing first {len(show_cols)})", fontweight="bold", fontsize=10)
     plt.tight_layout()
     fig.savefig(out_png, dpi=220)
     plt.close(fig)
+    return len(var_cols)
 
 
 # ==================== STREAMLIT UI ====================
-st.title("🧬 Universal Sanger-to-Phylogeny Workbench (v2.0)")
-st.caption("Developed by **Abinaya Chettri** (M.Sc. Zoology) — Automated Sanger QC, F+R Consensus, NCBI BLASTn + Country/Host Metadata, MAFFT, SNP Map, Population Genetics & IQ-TREE 2 Phylogenetics.")
+st.title("🧬 Universal Sanger-to-Phylogeny Workbench (v2.1)")
+st.caption("Developed by **Abinaya Chettri** (M.Sc. Zoology) — Automated Sanger QC, Validated F+R Consensus, NCBI BLASTn + Country/Host Metadata, MAFFT, SNP Map, Ingroup Population Genetics & IQ-TREE 2 Phylogenetics.")
 
 with st.expander("📖 Quick-Start Rules & Outgroup Guide (Read First Before Running)", expanded=False):
     st.markdown("""
 **1. `.ab1` vs. `.fasta` Rule:**
-* For your own PCR samples from a sequencing company, **always upload Forward `.ab1` (Box 1) + Reverse `.ab1` (Box 2)**—they hold the raw peaks and Phred quality scores.
+* For your own PCR samples from a sequencing company, **always upload Forward `.ab1` (Box 1) + Reverse `.ab1` (Box 2)**—they hold raw trace peaks and Phred quality scores.
 * Use `.fasta` only for already-cleaned consensus sequences or published GenBank records.
 
 **2. Two-Run Workflow (Discovery → Publication Figure):**
@@ -286,13 +333,13 @@ with st.expander("📖 Quick-Start Rules & Outgroup Guide (Read First Before Run
 * **Run 2 (Paper Figure):** Paste 2–4 verified GenBank accessions from published papers + 1 **Biological Outgroup** accession.
 
 **3. Outgroup Golden Rules (Prevents Squished Trees):**
-* **Same gene & similar length:** Match `cox1` with `cox1` (or `ITS-2` with `ITS-2`) of roughly the same length (≥70–100% of your sequence length—never mix a short 300 bp fragment into a 658 bp alignment).
+* **Same gene & similar length:** Match `cox1` with `cox1` (or `ITS-2` with `ITS-2`) of roughly the same length (≥70–100% of your query length).
 * **Close cousin, not a distant stranger:** Choose a sister species in the **same genus** (e.g., *Toxocara cati* for *Toxocara canis*; *Ancylostoma caninum* for *Ancylostoma ceylanicum*).
 * **Strong clade support threshold:** SH-aLRT ≥ 80% and UFBoot ≥ 95%.
 
-**4. Where to Use Your Final `.zip` Files:**
-* Upload `01_clean_query.fasta` to **NCBI Submission Portal — GenBank** to get official accession numbers before journal submission.
-* Upload `06_tree_for_MEGA_FigTree_iTOL.nwk` to **iTOL** (`itol.embl.de`) or **FigTree** for custom circular/colored tree layouts.
+**4. Population Genetics & Publication Note:**
+* v2.1 automatically **excludes the Outgroup** when computing `h`, `Hd`, `π`, `S`, and Tajima's `D`, and uses **strict ungapped A/C/G/T sites** (standard DnaSP/Tajima convention). For formal demographic inference (Tajima's `D`), upload your own single-population sample set via Box 3 rather than mixed global BLAST hits.
+* Upload `01_clean_query.fasta` to **NCBI Submission Portal — GenBank** for official accession numbers, and open `06_tree_for_MEGA_FigTree_iTOL.nwk` in **iTOL** (`itol.embl.de`) or **FigTree** for custom layouts.
 """)
 
 col1, col2, col3 = st.columns(3)
@@ -313,13 +360,16 @@ c3, c4, c5 = st.columns(3)
 with c3:
     extra_accs = st.text_input("Optional Published Reference Accessions (comma-separated)", placeholder="e.g., LC533328, AJ407962")
 with c4:
-    outgroup_acc = st.text_input("Optional Biological Outgroup Accession", placeholder="e.g., AJ407962 (blank = auto)")
+    outgroup_acc = st.text_input("Optional Biological Outgroup Accession", placeholder="e.g., AJ407962 (blank = midpoint)")
 with c5:
-    email = st.text_input("NCBI Email *", value="abinayachettri408@gmail.com")
+    email = st.text_input("NCBI Email (required for live BLAST) *", value=os.environ.get("NCBI_EMAIL", ""), placeholder="your.email@institution.edu")
 
-if st.button("🚀 Run Complete v2.0 Pipeline", type="primary", use_container_width=True):
+if st.button("🚀 Run Complete v2.1 Pipeline", type="primary", use_container_width=True):
     if primary_up is None:
-        st.error("Please upload a `.ab1` chromatogram or `.fasta` file first.")
+        st.error("Please upload a `.ab1` chromatogram or `.fasta` file in Box 1 first.")
+        st.stop()
+    if custom_refs_up is None and ("@" not in email.strip()):
+        st.error("Please enter a valid email address in the NCBI Email box (NCBI Entrez requires it for live BLAST/GenBank lookups).")
         st.stop()
 
     iqtree_bin = shutil.which("iqtree2") or shutil.which("iqtree")
@@ -327,8 +377,8 @@ if st.button("🚀 Run Complete v2.0 Pipeline", type="primary", use_container_wi
         st.error("Missing system binaries (`mafft` or `iqtree`). Ensure `packages.txt` includes `mafft` and `iqtree`.")
         st.stop()
 
-    work = tempfile.mkdtemp(prefix="phylo_v2_")
-    notes = []
+    work = tempfile.mkdtemp(prefix="phylo_v21_")
+    notes, warnings_list = [], []
     prog = st.progress(5, text="Reading & quality-trimming input...")
 
     def save_upload(up_file, subdir):
@@ -345,7 +395,13 @@ if st.button("🚀 Run Complete v2.0 Pipeline", type="primary", use_container_wi
         if quals:
             s, e = mott_trim(quals, int(q_cutoff))
             trim_s, trim_q = raw_s[s:e], quals[s:e]
-            notes.append(f"{os.path.basename(path)}: {len(raw_s)} bp -> {len(trim_s)} bp (mean Q={np.mean(trim_q):.1f})")
+            mean_q = float(np.mean(trim_q)) if trim_q else 0.0
+            ambig = sum(1 for b in trim_s if b not in "ACGT")
+            notes.append(f"{os.path.basename(path)}: {len(raw_s)} bp -> {len(trim_s)} bp (mean Q={mean_q:.1f}, ambiguous={ambig})")
+            if len(trim_s) < 150:
+                warnings_list.append(f"{os.path.basename(path)} trimmed to only {len(trim_s)} bp (<150 bp); check chromatogram quality.")
+            if mean_q < 25.0:
+                warnings_list.append(f"{os.path.basename(path)} has low mean quality (Q={mean_q:.1f}); inspect peaks manually.")
         else:
             s, e = 0, len(raw_s)
             trim_s, trim_q = re.sub(r"[^ACGTNRYMKSWBDHV]", "", raw_s), []
@@ -361,13 +417,16 @@ if st.button("🚀 Run Complete v2.0 Pipeline", type="primary", use_container_wi
     if reverse_up is not None:
         r_path = save_upload(reverse_up, work)
         _, seq_r, q_r, _, _ = read_seq(r_path)
-        final_seq, mm = merge_fr(seq_f, q_f, seq_r, q_r)
-        notes.append(f"F+R Consensus: {len(final_seq)} bp ({mm} base conflicts resolved by higher Phred Q)")
+        final_seq, mm, ov_bp, ov_id = merge_fr(seq_f, q_f, seq_r, q_r)
+        notes.append(f"F+R Consensus: {len(final_seq)} bp | Overlap={ov_bp} bp ({ov_id}% identity, {mm} conflicts resolved by higher Phred Q)")
+        if ov_bp < 50 or ov_id < 90.0:
+            warnings_list.append(f"Low Forward/Reverse consensus confidence (overlap={ov_bp} bp, identity={ov_id}%). Verify both reads belong to the same PCR amplicon before trusting results!")
 
     q_id = "QUERY_" + re.sub(r"[^A-Za-z0-9_.-]", "_", rec_f.id or "Sample")[:28]
     query_rec = SeqRecord(Seq(final_seq), id=q_id, description="")
     SeqIO.write([query_rec], f"{work}/01_clean_query.fasta", "fasta")
 
+    meta_df = pd.DataFrame()
     if custom_refs_up is not None:
         prog.progress(30, text="Loading custom reference FASTA...")
         c_path = save_upload(custom_refs_up, work)
@@ -375,8 +434,8 @@ if st.button("🚀 Run Complete v2.0 Pipeline", type="primary", use_container_wi
         blast_df = pd.DataFrame([{"Accession": r.id, "Length_bp": len(r.seq)} for r in refs])
         outgroup_label = outgroup_acc.strip() if outgroup_acc and outgroup_acc.strip() else None
     else:
-        prog.progress(20, text="Running live NCBI BLASTn + fetching Country/Host metadata (takes ~30-60s)...")
-        refs, blast_df, meta_df, outgroup_label = smart_blast_v2(final_seq, int(max_refs), extra_accs, outgroup_acc, email, work)
+        prog.progress(20, text="Running live NCBI BLASTn + fetching GenBank metadata (~30-60s)...")
+        refs, blast_df, meta_df, outgroup_label = smart_blast_v2(final_seq, int(max_refs), extra_accs, outgroup_acc, email, work, warnings_list)
 
     if len(refs) < 3:
         st.error("Need at least 3 reference sequences to build a phylogenetic tree.")
@@ -406,10 +465,10 @@ if st.button("🚀 Run Complete v2.0 Pipeline", type="primary", use_container_wi
     SeqIO.write(trimmed, trim_fa, "fasta")
 
     snp_png = f"{work}/04_alignment_snp_map.png"
-    plot_snp_map(trimmed, snp_png)
+    total_snp_sites = plot_snp_map(trimmed, snp_png)
 
-    prog.progress(68, text="Computing K2P distances & Population Genetics (h, Hd, pi, Tajima's D)...")
-    pop_df = compute_popgen_stats(trimmed, work)
+    prog.progress(68, text="Computing K2P distances & Ingroup Population Genetics...")
+    pop_df = compute_popgen_stats(trimmed, work, outgroup_label=outgroup_label)
     names, seqs = [r.id for r in trimmed], [str(r.seq) for r in trimmed]
     n = len(seqs)
     p_mat, k_mat = np.zeros((n, n)), np.zeros((n, n))
@@ -446,9 +505,14 @@ if st.button("🚀 Run Complete v2.0 Pipeline", type="primary", use_container_wi
 
     prog.progress(92, text="Rendering 300 DPI tree & packaging ZIP...")
     tree = Phylo.read(f"{prefix}.treefile", "newick")
-    try:
-        tree.root_with_outgroup(outgroup_label) if (outgroup_label and outgroup_label in names) else tree.root_at_midpoint()
-    except Exception:
+    root_note = "Midpoint-rooted (no biological outgroup specified)"
+    if outgroup_label and outgroup_label in names:
+        try:
+            tree.root_with_outgroup(outgroup_label)
+            root_note = f"Rooted on biological outgroup: {outgroup_label}"
+        except Exception:
+            tree.root_at_midpoint()
+    else:
         tree.root_at_midpoint()
     tree.ladderize()
 
@@ -475,7 +539,7 @@ if st.button("🚀 Run Complete v2.0 Pipeline", type="primary", use_container_wi
             if clade.name and "/" in str(clade.name):
                 ax.text(depths.get(clade, 0.0) - max_x * 0.008, y_pos[clade] - 0.14, str(clade.name), fontsize=7.5, color="#374151", ha="right", va="bottom")
 
-    ax.set_title(f"Maximum Likelihood Phylogeny (IQ-TREE 2 | Model: {best_model} | SH-aLRT / UFBoot 1000x)", fontweight="bold", fontsize=10.5)
+    ax.set_title(f"Maximum Likelihood Phylogeny (IQ-TREE 2 | Model: {best_model} | SH-aLRT / UFBoot 1000x)\n{root_note}", fontweight="bold", fontsize=10)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.spines["left"].set_visible(False)
@@ -487,30 +551,48 @@ if st.button("🚀 Run Complete v2.0 Pipeline", type="primary", use_container_wi
     fig.savefig(tree_pdf)
     plt.close(fig)
 
+    mafft_ver = get_tool_version(["mafft", "--version"])
+    iqtree_ver = get_tool_version([iqtree_bin, "--version"])
+    acc_used = ", ".join(meta_df["Accession"].tolist()) if not meta_df.empty else "Custom FASTA references"
     pr = pop_df.iloc[0]
+    warn_block = "\n  - ".join(warnings_list) if warnings_list else "None"
     summary = (
-        f"Universal Sanger-to-Phylogeny Workbench (v2.0) — Developed by Abinaya Chettri\n"
-        f"Run completed: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-        f"QC:\n  - " + "\n  - ".join(notes) + "\n\n"
-        f"Alignment: {len(trimmed)} taxa | {arr.shape[1]} bp raw -> {len(keep)} bp trimmed\n"
-        f"Population Genetics: h={int(pr['Haplotypes_h'])} | Hd={pr['Haplotype_Diversity_Hd']} | pi={pr['Nucleotide_Diversity_pi']} | S={int(pr['Segregating_Sites_S'])} | Tajima's D={pr['Tajimas_D']}\n"
-        f"Best-fit Model (BIC): {best_model} | Rooted on: {outgroup_label or 'Midpoint'}\n"
+        f"Universal Sanger-to-Phylogeny Workbench (v2.1) — Developed by Abinaya Chettri\n"
+        f"Run Date (UTC): {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"Software Versions: Python {platform.python_version()} | Biopython {Bio.__version__} | {mafft_ver} | {iqtree_ver}\n"
+        f"Parameters: Mott Q={int(q_cutoff)} | Max BLAST refs={int(max_refs)} | Gap trim <=50%\n\n"
+        f"QC & Consensus:\n  - " + "\n  - ".join(notes) + "\n\n"
+        f"Alignment & SNP Consistency:\n"
+        f"  - Total taxa: {len(trimmed)} | Alignment: {arr.shape[1]} bp raw -> {len(keep)} bp trimmed\n"
+        f"  - Visual SNP Map variable sites (all taxa, incl. gapped/outgroup cols): {total_snp_sites}\n"
+        f"  - Ingroup PopGen strict ungapped ACGT sites: {int(pr['Ungapped_ACGT_Sites_bp'])} bp (excluded {int(pr['Excluded_Gapped_or_Ambig_bp'])} gapped/ambiguous cols)\n\n"
+        f"Ingroup Population Genetics (Outgroup excluded):\n"
+        f"  - n={int(pr['Ingroup_Taxa_n'])} | h={int(pr['Haplotypes_h'])} | Hd={pr['Haplotype_Diversity_Hd']} | pi={pr['Nucleotide_Diversity_pi']} | S={int(pr['Segregating_Sites_S'])} | Tajima's D={pr['Tajimas_D']}\n"
+        f"  - Note: Interpret Tajima's D cautiously if ingroup consists of mixed global GenBank BLAST hits rather than a single biological population.\n\n"
+        f"Phylogeny:\n"
+        f"  - Best-fit Model (BIC): {best_model} | Support: 1,000x SH-aLRT / 1,000x UFBoot (-bnni)\n"
+        f"  - Rooting: {root_note}\n"
+        f"  - GenBank Accessions Used: {acc_used}\n\n"
+        f"Validation Warnings:\n  - {warn_block}\n"
     )
     with open(f"{work}/07_methods_and_reproducibility_report.txt", "w") as f:
         f.write(summary)
 
-    zip_name = f"phylogeny_v2_results_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    zip_name = f"phylogeny_v21_results_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     zip_path = os.path.join(work, zip_name)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for fn in sorted(os.listdir(work)):
-            if fn.endswith(".zip") or fn == os.path.basename(p_path):
+            if fn.endswith(".zip"):
                 continue
             zf.write(os.path.join(work, fn), arcname=fn)
 
     prog.progress(100, text="Done!")
-    st.success("Pipeline complete! Download your full 26-file reproducibility archive below.")
+    if warnings_list:
+        for w in warnings_list:
+            st.warning(f"⚠️ {w}")
+    st.success("Pipeline complete! Download your full reproducibility archive below (includes original uploaded files + logs).")
     with open(zip_path, "rb") as f:
-        st.download_button("⬇️ Download Complete v2.0 Results (.zip)", f.read(), file_name=zip_name, mime="application/zip", use_container_width=True)
+        st.download_button("⬇️ Download Complete v2.1 Results (.zip)", f.read(), file_name=zip_name, mime="application/zip", use_container_width=True)
 
     st.subheader("ML Phylogenetic Tree (300 DPI, Country + Host labels)")
     st.image(tree_png, use_container_width=True)
@@ -518,9 +600,10 @@ if st.button("🚀 Run Complete v2.0 Pipeline", type="primary", use_container_wi
     st.image(snp_png, use_container_width=True)
     st.subheader("Chromatogram & Phred QC")
     st.image(qc_png, use_container_width=True)
-    st.subheader("Population Genetics & Haplotype Diversity")
+    st.subheader("Ingroup Population Genetics & Haplotype Diversity (Outgroup Excluded)")
+    st.caption("Computed on ingroup sequences using strict ungapped A/C/G/T sites (standard DnaSP/Tajima convention). Use Box 3 with a single biological population for formal demographic inference.")
     st.dataframe(pop_df, use_container_width=True)
     st.subheader("Top BLAST Hits")
     st.dataframe(blast_df, use_container_width=True)
-    st.subheader("QC, Model & Draft Methods Report")
+    st.subheader("QC, Model & Reproducibility Report")
     st.code(summary, language="text")
