@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software in your research or publication, please cite it as below."
+title: "Universal Sanger-to-Phylogeny Workbench (v2.0)"
+version: "2.0.0"
+date-released: 2026-11-25
+authors:
+  - family-names: "Chettri"
+    given-names: "Abinaya"
+    email: "abinayachettri408@gmail.com"
+    affiliation: "Sikkim University / ATREE AMP-Himalaya"
+keywords:
+  - phylogenetics
+  - sanger-sequencing
+  - parasitology
+  - dna-barcoding
+  - iqtree2
+  - bioinformatics
+license: MIT
