@@ -21,8 +21,14 @@ from Bio.Blast import NCBIWWW, NCBIXML
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 
+APP_VERSION = "v2.1"
+REPO_URL = "https://github.com/AbinayaChettri/sanger-phylogeny-workbench-NBBGC-TADONG-"
+APP_URL = "https://nbbgc-tadong-phylogeny.streamlit.app"
+AUTHOR_ORCID = "0009-0000-9037-9699"
+FIGURE_CREDIT = f"Generated with Universal Sanger-to-Phylogeny Workbench ({APP_VERSION}) — Chettri (2026) | {REPO_URL}"
+
 st.set_page_config(
-    page_title="Sanger-to-Phylogeny Workbench (v2.1)",
+    page_title=f"Sanger-to-Phylogeny Workbench ({APP_VERSION})",
     page_icon="🧬",
     layout="wide",
 )
@@ -55,7 +61,7 @@ def mott_trim(quals, q_cutoff=20):
 def plot_qc(rec, s, e, out_png):
     quals = list(rec.letter_annotations.get("phred_quality", []))
     raw = rec.annotations.get("abif_raw", {})
-    fig, axes = plt.subplots(2, 1, figsize=(11, 5), dpi=250, gridspec_kw={"height_ratios": [1.3, 1]})
+    fig, axes = plt.subplots(2, 1, figsize=(11, 5.2), dpi=250, gridspec_kw={"height_ratios": [1.3, 1]})
     if all(k in raw for k in ("DATA9", "DATA10", "DATA11", "DATA12")):
         ploc = raw.get("PLOC2") or raw.get("PLOC1")
         s_idx = max(0, ploc[s] - 10) if ploc and len(ploc) > s else 0
@@ -81,7 +87,8 @@ def plot_qc(rec, s, e, out_png):
     else:
         axes[1].text(0.5, 0.5, "No Phred quality scores (FASTA input)", ha="center", va="center", color="#4B5563")
         axes[1].set_axis_off()
-    plt.tight_layout()
+    fig.text(0.99, 0.008, FIGURE_CREDIT, ha="right", va="bottom", fontsize=6.5, color="#6B7280", style="italic")
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
     fig.savefig(out_png, dpi=250)
     plt.close(fig)
 
@@ -292,7 +299,7 @@ def compute_popgen_stats(trimmed_recs, work_dir, outgroup_label=None):
 def plot_snp_map(trimmed_recs, out_png):
     arr = np.array([list(str(r.seq).upper()) for r in trimmed_recs])
     var_cols = [c for c in range(arr.shape[1]) if len(set(arr[:, c]) - {"-", "N"}) > 1]
-    fig, ax = plt.subplots(figsize=(11, max(4.0, len(trimmed_recs) * 0.35 + 1.2)), dpi=220)
+    fig, ax = plt.subplots(figsize=(11, max(4.2, len(trimmed_recs) * 0.35 + 1.4)), dpi=220)
     if not var_cols:
         ax.text(0.5, 0.5, "No variable SNP sites detected across trimmed alignment.", ha="center", va="center")
         ax.set_axis_off()
@@ -312,15 +319,16 @@ def plot_snp_map(trimmed_recs, out_png):
         ax.set_xticklabels([str(c + 1) for c in show_cols], rotation=90, fontsize=6.5)
         ax.set_xlabel("Alignment Position (bp) — All Variable Sites (including gapped/outgroup columns)")
         ax.set_title(f"Alignment SNP & Mismatch Map ({len(var_cols)} variable sites; showing first {len(show_cols)})", fontweight="bold", fontsize=10)
-    plt.tight_layout()
+    fig.text(0.99, 0.008, FIGURE_CREDIT, ha="right", va="bottom", fontsize=6.5, color="#6B7280", style="italic")
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
     fig.savefig(out_png, dpi=220)
     plt.close(fig)
     return len(var_cols)
 
 
 # ==================== STREAMLIT UI ====================
-st.title("🧬 Universal Sanger-to-Phylogeny Workbench (v2.1)")
-st.caption("Developed by **Abinaya Chettri** (M.Sc. Zoology) — Automated Sanger QC, Validated F+R Consensus, NCBI BLASTn + Country/Host Metadata, MAFFT, SNP Map, Ingroup Population Genetics & IQ-TREE 2 Phylogenetics.")
+st.title(f"🧬 Universal Sanger-to-Phylogeny Workbench ({APP_VERSION})")
+st.caption(f"Developed by **Abinaya Chettri** (M.Sc. Zoology | ORCID: {AUTHOR_ORCID}) — Automated Sanger QC, Validated F+R Consensus, NCBI BLASTn + Country/Host Metadata, MAFFT, SNP Map, Ingroup Population Genetics & IQ-TREE 2 Phylogenetics.")
 
 with st.expander("📖 Quick-Start Rules & Outgroup Guide (Read First Before Running)", expanded=False):
     st.markdown("""
@@ -364,7 +372,7 @@ with c4:
 with c5:
     email = st.text_input("NCBI Email (required for live BLAST) *", value=os.environ.get("NCBI_EMAIL", ""), placeholder="your.email@institution.edu")
 
-if st.button("🚀 Run Complete v2.1 Pipeline", type="primary", use_container_width=True):
+if st.button(f"🚀 Run Complete {APP_VERSION} Pipeline", type="primary", use_container_width=True):
     if primary_up is None:
         st.error("Please upload a `.ab1` chromatogram or `.fasta` file in Box 1 first.")
         st.stop()
@@ -516,7 +524,7 @@ if st.button("🚀 Run Complete v2.1 Pipeline", type="primary", use_container_wi
         tree.root_at_midpoint()
     tree.ladderize()
 
-    fig_h = max(6.0, len(tree.get_terminals()) * 0.45 + 1.6)
+    fig_h = max(6.2, len(tree.get_terminals()) * 0.45 + 1.8)
     fig, ax = plt.subplots(figsize=(12.5, fig_h), dpi=300)
     Phylo.draw(tree, axes=ax, do_show=False, label_func=lambda c: f"  {c.name}" if c.is_terminal() else "", show_confidence=False)
     max_x = max(tree.depths().values()) or 0.01
@@ -545,7 +553,8 @@ if st.button("🚀 Run Complete v2.1 Pipeline", type="primary", use_container_wi
     ax.spines["left"].set_visible(False)
     ax.get_yaxis().set_visible(False)
     ax.set_xlabel("Substitutions per site")
-    plt.tight_layout()
+    fig.text(0.99, 0.008, FIGURE_CREDIT, ha="right", va="bottom", fontsize=6.5, color="#6B7280", style="italic")
+    plt.tight_layout(rect=[0, 0.025, 1, 1])
     tree_png, tree_pdf = f"{work}/06_phylogenetic_tree_300dpi.png", f"{work}/06_phylogenetic_tree_vector.pdf"
     fig.savefig(tree_png, dpi=300)
     fig.savefig(tree_pdf)
@@ -556,11 +565,25 @@ if st.button("🚀 Run Complete v2.1 Pipeline", type="primary", use_container_wi
     acc_used = ", ".join(meta_df["Accession"].tolist()) if not meta_df.empty else "Custom FASTA references"
     pr = pop_df.iloc[0]
     warn_block = "\n  - ".join(warnings_list) if warnings_list else "None"
+
+    methods_citation = (
+        f"Sanger sequence quality control (Mott trimming at Q={int(q_cutoff)}), NCBI BLASTn reference curation, "
+        f"multiple sequence alignment (MAFFT --auto across {len(trimmed)} taxa; {len(keep)} bp after <=50% gap trimming), "
+        f"ingroup population genetics, and Maximum-Likelihood phylogenetic inference (IQ-TREE 2; best-fit BIC model {best_model}; "
+        f"1,000 SH-aLRT and 1,000 ultrafast bootstrap replicates; {root_note}) were performed using Universal Sanger-to-Phylogeny Workbench "
+        f"({APP_VERSION}; Chettri, 2026; {REPO_URL}).\n\n"
+        f"Reference:\n"
+        f"Chettri, A. (2026). Universal Sanger-to-Phylogeny Workbench ({APP_VERSION}) [Computer software]. "
+        f"ORCID: https://orcid.org/{AUTHOR_ORCID}. Available at: {REPO_URL} (Web app: {APP_URL})."
+    )
+
     summary = (
-        f"Universal Sanger-to-Phylogeny Workbench (v2.1) — Developed by Abinaya Chettri\n"
+        f"Universal Sanger-to-Phylogeny Workbench ({APP_VERSION}) — Developed by Abinaya Chettri (ORCID: {AUTHOR_ORCID})\n"
         f"Run Date (UTC): {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
         f"Software Versions: Python {platform.python_version()} | Biopython {Bio.__version__} | {mafft_ver} | {iqtree_ver}\n"
         f"Parameters: Mott Q={int(q_cutoff)} | Max BLAST refs={int(max_refs)} | Gap trim <=50%\n\n"
+        f"HOW TO CITE (Ready-to-Paste Methods & Reference):\n"
+        f"{methods_citation}\n\n"
         f"QC & Consensus:\n  - " + "\n  - ".join(notes) + "\n\n"
         f"Alignment & SNP Consistency:\n"
         f"  - Total taxa: {len(trimmed)} | Alignment: {arr.shape[1]} bp raw -> {len(keep)} bp trimmed\n"
@@ -592,7 +615,10 @@ if st.button("🚀 Run Complete v2.1 Pipeline", type="primary", use_container_wi
             st.warning(f"⚠️ {w}")
     st.success("Pipeline complete! Download your full reproducibility archive below (includes original uploaded files + logs).")
     with open(zip_path, "rb") as f:
-        st.download_button("⬇️ Download Complete v2.1 Results (.zip)", f.read(), file_name=zip_name, mime="application/zip", use_container_width=True)
+        st.download_button(f"⬇️ Download Complete {APP_VERSION} Results (.zip)", f.read(), file_name=zip_name, mime="application/zip", use_container_width=True)
+
+    st.info("📚 **Using these results in a thesis or paper?** Copy-paste the ready-made Methods & Citation text below:")
+    st.code(methods_citation, language="text")
 
     st.subheader("ML Phylogenetic Tree (300 DPI, Country + Host labels)")
     st.image(tree_png, use_container_width=True)
